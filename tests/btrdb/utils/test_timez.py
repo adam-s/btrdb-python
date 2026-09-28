@@ -16,11 +16,12 @@ Testing for the btrdb.timez module
 ##########################################################################
 
 import datetime
+from unittest.mock import patch
 
 import numpy as np
+import pandas as pd
 import pytest
 import pytz
-from freezegun import freeze_time
 
 from btrdb.utils.timez import (
     currently_as_ns,
@@ -38,10 +39,10 @@ from btrdb.utils.timez import (
 class TestCurrentlyAsNs(object):
     def test_currently_as_ns(self):
         """
-        Assert currently_as_ns returns correct value
+        Assert currently_as_ns returns the clock's nanoseconds, unrounded
         """
-        expected = 1514808000000000000
-        with freeze_time("2018-01-01 12:00:00 -0000"):
+        expected = 1514808000123456789
+        with patch("time.time_ns", return_value=expected):
             assert currently_as_ns() == expected
 
 
@@ -50,9 +51,8 @@ class TestDatetimeToNs(object):
         """
         Assert datetime_to_ns handles naive datetime
         """
-        dt = datetime.datetime(2018, 1, 1, 12)
-        localized = pytz.utc.localize(dt)
-        expected = int(localized.timestamp() * 1e9)
+        dt = datetime.datetime(2018, 1, 1, 12, 0, 0, 123457)
+        expected = 1514808000123457000
 
         assert dt.tzinfo is None
         assert datetime_to_ns(dt) == expected
@@ -62,11 +62,15 @@ class TestDatetimeToNs(object):
         Assert datetime_to_ns handles tz aware datetime
         """
         eastern = pytz.timezone("US/Eastern")
-        dt = datetime.datetime(2018, 1, 1, 17, tzinfo=eastern)
-        expected = int(dt.astimezone(pytz.utc).timestamp() * 1e9)
+        dt = datetime.datetime(2018, 1, 1, 17, 0, 0, 123457, tzinfo=eastern)
+        expected = 1514843760123457000
 
         assert dt.tzinfo is not None
         assert datetime_to_ns(dt) == expected
+        assert (
+            datetime_to_ns(pd.Timestamp("2018-01-01 12:00:00.123456789", tz="UTC"))
+            == 1514808000123456789
+        )
 
 
 class TestNsToDatetime(object):
@@ -84,8 +88,8 @@ class TestNsToDatetime(object):
         """
         Assert ns_to_datetime returns correct datetime
         """
-        val = 1514808000000000000
-        expected = datetime.datetime(2018, 1, 1, 12, tzinfo=pytz.UTC)
+        val = 1514808000123457501
+        expected = datetime.datetime(2018, 1, 1, 12, 0, 0, 123458, tzinfo=pytz.UTC)
 
         assert ns_to_datetime(val) == expected
 
@@ -95,9 +99,8 @@ class TestToNanoseconds(object):
         """
         Assert to_nanoseconds handles naive datetime
         """
-        dt = datetime.datetime(2018, 1, 1, 12)
-        localized = pytz.utc.localize(dt)
-        expected = int(localized.timestamp() * 1e9)
+        dt = datetime.datetime(2018, 1, 1, 12, 0, 0, 123457)
+        expected = 1514808000123457000
 
         assert dt.tzinfo is None
         assert to_nanoseconds(dt) == expected
@@ -134,6 +137,13 @@ class TestToNanoseconds(object):
         expected = int(dt.timestamp() * 1e9)
         assert to_nanoseconds(dt_str) == expected
 
+        assert to_nanoseconds("2018-01-01T12:00:00.123456789Z") == 1514808000123456789
+        assert to_nanoseconds("2018-01-01 12:00:00.1234567") == 1514808000123456700
+        dt_str = "2018-01-01T13:00:00.12345678+01:00"
+        assert to_nanoseconds(dt_str) == 1514808000123456780
+        dt_str = "2018-01-01 12:00:01.1234567+00:00:01.000001"
+        assert to_nanoseconds(dt_str) == 1514808000123455700
+
     def test_str_midnight(self):
         """
         Test parse a date at midnight
@@ -149,6 +159,10 @@ class TestToNanoseconds(object):
         dt_str = "01 Jan 2018 12:00:00 -0000"
         with pytest.raises(ValueError, match="RFC3339") as exc:
             to_nanoseconds(dt_str)
+        with pytest.raises(ValueError, match="RFC3339"):
+            to_nanoseconds("2018-01-01T12:00:00.1234567891Z")  # ten decimals
+        with pytest.raises(ValueError, match="RFC3339"):
+            to_nanoseconds("2018-01-01 12:00:00+00:00:01.1234567")  # a zone's decimals
 
     def test_int(self):
         """
@@ -170,15 +184,48 @@ class TestToNanoseconds(object):
             to_nanoseconds(42.5)
         assert "can only convert whole numbers" in str(exc)
 
-    def test_float(self):
+    def test_datetime64(self):
         """
-        Assert to_nanoseconds handles float
+        Assert to_nanoseconds handles datetime64, to the nanosecond
         """
         dt = datetime.datetime(2018, 1, 1, 12, tzinfo=pytz.utc)
         expected = int(dt.timestamp() * 1e9)
 
         dt64 = np.datetime64("2018-01-01T12:00")
         assert expected == to_nanoseconds(dt64)
+        assert (
+            to_nanoseconds(np.datetime64("2018-01-01T12:00:00.123456789"))
+            == 1514808000123456789
+        )
+        assert (
+            to_nanoseconds(np.datetime64("2300-01-01T00:00:00.123457"))
+            == 10413792000123457000
+        )
+        assert to_nanoseconds(np.datetime64("2018-01")) == 1514764800000000000
+        assert to_nanoseconds(np.datetime64("2018")) == 1514764800000000000
+        assert to_nanoseconds(np.datetime64("2018-01-04", "W")) == 1515024000000000000
+        assert to_nanoseconds(np.datetime64("2018-01-01T12")) == 1514808000000000000
+        assert (
+            to_nanoseconds(np.datetime64("2018-01-01T12:00:00.123"))
+            == 1514808000123000000
+        )
+        assert (
+            to_nanoseconds(np.datetime64(151480800012, "10ms")) == 1514808000120000000
+        )
+        assert to_nanoseconds(np.datetime64(-1500, "ps")) == -2  # rounded down
+        # the lowest counts, and a unit with a multiplier
+        assert to_nanoseconds(np.datetime64(-(2**63) + 1, "ps")) == -9223372036854776
+        assert to_nanoseconds(np.datetime64(-(2**63) + 1, "as")) == -9223372037
+        assert to_nanoseconds(np.datetime64(2 * 10**18, "7fs")) == 14000000000000
+
+    def test_datetime64_raise_typeerror(self):
+        """
+        Assert to_nanoseconds raises on a datetime64 that holds no time
+        """
+        no_unit = np.array([5], dtype=np.int64).view("M8")[0]
+        for dt64 in (np.datetime64("NaT", "ns"), no_unit):
+            with pytest.raises(TypeError):
+                to_nanoseconds(dt64)
 
 
 class TestToNsDelta(object):
