@@ -17,8 +17,11 @@ Time related utilities
 ## Imports
 ##########################################################################
 
-from datetime import datetime
+import re
+import time
+from datetime import date, datetime, timedelta
 from decimal import Decimal
+from fractions import Fraction
 from operator import mul
 
 import pytz
@@ -27,6 +30,7 @@ import pytz
 ## Module Variables
 ##########################################################################
 
+EPOCH = datetime(1970, 1, 1, tzinfo=pytz.utc)
 DATETIME_FORMATS = (
     "%Y-%m-%d %H:%M:%S.%f%z",  # most common RFC3339 nanoseconds
     "%Y-%m-%d %H:%M:%S.%f",  # expects UTC default timezone
@@ -49,8 +53,7 @@ def currently_as_ns():
     """
     Returns the current UTC time as nanoseconds since epoch
     """
-    dt = datetime.utcnow()
-    return int(dt.replace(tzinfo=pytz.utc).timestamp() * 1e9)
+    return time.time_ns()
 
 
 def ns_to_datetime(ns):
@@ -67,8 +70,7 @@ def ns_to_datetime(ns):
     nanoseconds since epoch as a datetime object : datetime
 
     """
-    dt = datetime.utcfromtimestamp(ns / 1e9)
-    return dt.replace(tzinfo=pytz.utc)
+    return EPOCH + timedelta(microseconds=int(round(Fraction(ns) / 1000)))
 
 
 def datetime_to_ns(dt):
@@ -85,13 +87,12 @@ def datetime_to_ns(dt):
     nanoseconds : int
 
     """
-    if dt.tzinfo is None or dt.tzinfo.utcoffset(dt) is None:
-        aware = pytz.utc.localize(dt)
-    else:
-        aware = dt
-
-    dt_utc = aware.astimezone(pytz.utc)
-    return int(dt_utc.timestamp() * 1e9)
+    # from its fields, in integers, so nothing is rounded
+    offset = dt.utcoffset()  # None when naive: the time is taken as UTC
+    days = dt.toordinal() - EPOCH.toordinal()
+    seconds = ((days * 24 + dt.hour) * 60 + dt.minute) * 60 + dt.second
+    ns = seconds * 1_000_000_000 + dt.microsecond * 1000 + getattr(dt, "nanosecond", 0)
+    return ns - offset // timedelta(microseconds=1) * 1000 if offset else ns
 
 
 def to_nanoseconds(val):
@@ -141,8 +142,20 @@ def to_nanoseconds(val):
     try:
         import numpy as np
 
-        if isinstance(val, np.datetime64):
-            val = val.astype(datetime)
+        # no unit (dtype M8, numpy's "generic") means no time: TypeError below
+        if isinstance(val, np.datetime64) and val.dtype != "M8" and not np.isnat(val):
+            # count with Python integers: numpy's own casts can wrap past their range
+            unit, step = np.datetime_data(val.dtype)
+            count = int(val.view(np.int64)) * step
+            if unit in ("Y", "M"):  # the calendar repeats every 400 years (146097 days)
+                year, month = divmod(count * (12 if unit == "Y" else 1) + 1970 * 12, 12)
+                cycles, year = divmod(year - 1, 400)
+                days = date(year + 1, month + 1, 1).toordinal() - EPOCH.toordinal()
+                count, unit = days + cycles * 146097, "D"
+            if unit in ("ps", "fs", "as"):  # below 1 ns, round down as numpy does
+                return count // 10 ** {"ps": 3, "fs": 6, "as": 9}[unit]
+            count *= {"W": 604800, "D": 86400, "h": 3600, "m": 60}.get(unit, 1)
+            return count * 10 ** {"ms": 6, "us": 3, "ns": 0}.get(unit, 9)
     except ImportError:
         pass
 
@@ -150,6 +163,10 @@ def to_nanoseconds(val):
         # handle int as string
         if val.isdigit():
             return int(val)
+
+        # strptime reads six decimals of the seconds at most; the rest are nanoseconds
+        m = re.fullmatch(r"(\d+-\d+-\d+[\sTt]+\d+:\d+:\d+\.\d{6})(\d{1,3})(\D.*)?", val)
+        extra, val = (int(m[2].ljust(3, "0")), m[1] + (m[3] or "")) if m else (0, val)
 
         # handle datetime as string
         for format in DATETIME_FORMATS:
@@ -161,6 +178,7 @@ def to_nanoseconds(val):
 
         if isinstance(val, str):
             raise ValueError("unsupported string format, please use RFC3339")
+        return datetime_to_ns(val) + extra
 
     if isinstance(val, datetime):
         return datetime_to_ns(val)
